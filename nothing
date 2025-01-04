@@ -1,114 +1,94 @@
-#include "IMU_Fusion_SYC.h"
+#include "IMU_Fusion_SYC.h"  // IMUライブラリをインクルード
+#include <SD.h>              // SDカードライブラリをインクルード
+#include <SPI.h>             // SPI通信ライブラリをインクルード
 
+// IMUオブジェクトの作成
 IMU imu(Wire);
 
-// TB6612FNG PIN定義
-const int PWMA = 9;    // Motor A PWM
-const int AIN1 = 11;   // Motor A Input 1
-const int AIN2 = 10;   // Motor A Input 2
-const int PWMB = 15;   // Motor B PWM
-const int BIN1 = 13;   // Motor B Input 1
-const int BIN2 = 14;   // Motor B Input 2
-const int STBY = 12;    // Standby
+// モーター制御用ピンの定義
+const int PWMA = 9;  // モーターAのPWMピン
+const int AIN1 = 10; // モーターAの方向制御ピン1
+const int AIN2 = 11; // モーターAの方向制御ピン2
+const int PWMB = 15; // モーターBのPWMピン
+const int BIN1 = 13; // モーターBの方向制御ピン1
+const int BIN2 = 14; // モーターBの方向制御ピン2
+const int STBY = 12; // モーターのスタンバイ制御ピン
 
-// 制御パラメータ
-const int BASE_SPEED = 64;       // 基準速度（0-255）
-const int motor_dif = 0;
-const int MAX_SPEED_DIFF = 32;   // 最大速度差
+// その他のピン定義
+const int PULLUP_PIN = 28; // プルアップ入力ピン（シーケンス用）
+const int OUTPUT_PIN = 1;  // アクション制御用出力ピン
 
-// キャリブレーション用パラメータ
-float referenceAngle = -1;  
-unsigned long stableStartTime = 100;  
-bool isCalibrated = false;  
-const unsigned long angleTolerance = 0.5; //角度ズレの許容範囲
-const unsigned long stableTimeRequired = 1000;  //基準角度再設定にかける時間
-const float incorrectangle = 20; //磁場の乱れと判断する角度
-const unsigned long runningtime = 500; //乱れと判定後直進する時間
+// SDカード通信ピンの定義
+#define SD_MISO  16  // SDカードのMISOピン
+#define SD_CS    17  // SDカードのCSピン
+#define SD_SCK   18  // SDカードのSCKピン
+#define SD_MOSI  19  // SDカードのMOSIピン
+#define NAME     "Running" // ファイル名のベース名
 
-// フライトピンの状態を検知するピンと出力ピン
-const int PULLUP_PIN = 28;  // フライトピン（プルアップ）
-const int OUTPUT_PIN = 1;   // 出力ピン（GPIO1）
-bool flightPinState = HIGH; // 初期状態は「刺さっている」
-unsigned long pinLowTime = 0; // ピンが抜けた時刻を記録
-bool actionTriggered = false; // 動作開始がトリガーされたか
+// SDカード操作用
+File myFile;
+int number = 1; // ファイル番号
+String str;
+String filename;
 
-void setup() {
-  Serial.begin(9600);
-  Wire.begin();
-  
-  // IMUの初期化
-  imu.QMC5883L_SetOffsets(147.00, -443.00, -152.00);
-  imu.QMC5883L_SetScales(1.10, 1.14, 0.82);
-  imu.Heading_Offset(360);
-  imu.begin(CHOOSE_ALL);
+// モーター制御の設定
+const int BASE_SPEED = 128;      // モーターの基本速度
+const int MAX_SPEED_DIFF = 64;  // モーター速度差の最大値
+const int motorDiff = 11;       // モーター間の補正値
 
+// システム状態管理用
+bool flightPinState = HIGH;  // ピン状態フラグ
+unsigned long pinLowTime = 0; // ピンがLOWになった時間
+bool actionTriggered = false; // アクションが実行されたかのフラグ
 
-  //ピン設定
-  pinMode(PWMA, OUTPUT);
-  pinMode(AIN1, OUTPUT);
-  pinMode(AIN2, OUTPUT);
-  pinMode(PWMB, OUTPUT);
-  pinMode(BIN1, OUTPUT);
-  pinMode(BIN2, OUTPUT);
-  pinMode(STBY, OUTPUT);
-  pinMode(PULLUP_PIN, INPUT_PULLUP);  // フライトピン
-  pinMode(OUTPUT_PIN, OUTPUT);       // 出力ピン
-  // 初期状態ではスタンバイモードに
-  digitalWrite(STBY, LOW);
+// キャリブレーション用
+float referenceAngle = -1;  // 基準角度
+unsigned long stableStartTime = 0; // 安定状態の開始時間
+bool isCalibrated = false;  // キャリブレーション状態
+const float angleTolerance = 0.5;  // 許容角度の範囲
+const unsigned long stableTimeRequired = 1000;  // 安定に必要な時間(ms)
 
-  // モーターの初期方向設定
-  digitalWrite(AIN1, HIGH);
-  digitalWrite(AIN2, LOW);
-  digitalWrite(BIN1, HIGH);
-  digitalWrite(BIN2, LOW);
-}
-
-// モーターを完全に停止する関数
-void stopMotors() {
-  digitalWrite(STBY, LOW);
-  analogWrite(PWMA, 0);
-  analogWrite(PWMB, 0);
-}
-
-// モーターを動作可能状態にする関数
-void enableMotors() {
-  digitalWrite(STBY, HIGH);
-}
-//モーターを制御する関数
-void setMotorSpeeds(float angleError) {
-  // 角度誤差に基づいて速度差を計算
-  int speedDiff = map(constrain(abs(angleError), 0, 45), 0, 45, 0, MAX_SPEED_DIFF);
-  
-  int speedA, speedB;
-  
-  if (angleError < 0) {
-    // 左に曲がる必要がある場合（モーターAを速く）
-    speedA = BASE_SPEED + speedDiff;
-    speedB = BASE_SPEED - speedDiff;
-  } else if (angleError > 0) {
-    // 右に曲がる必要がある場合（モーターBを速く）
-    speedA = BASE_SPEED - speedDiff;
-    speedB = BASE_SPEED + speedDiff;
-  } else {
-    // 真っ直ぐの場合（同じ速度）
-    speedA = BASE_SPEED;
-    speedB = BASE_SPEED + motor_dif;
+// 新しいファイルを作成する関数
+void createNewFile() {
+  while (true) {
+    filename = NAME + (String)number + ".txt"; // ファイル名の生成
+    if (!SD.exists(filename.c_str())) {        // ファイルが存在しない場合
+      myFile = SD.open(filename, FILE_WRITE);  // ファイルを作成
+      if (myFile) {
+        Serial.print("New file created: ");
+        Serial.println(filename);
+        break;
+      } else {
+        Serial.println("Failed to create file!");
+        return;
+      }
+    }
+    number++;
   }
-
-  // 速度を適用
-  analogWrite(PWMA, speedA);
-  analogWrite(PWMB, speedB);
-
-  // デバッグ出力
-  Serial.print("Current Angle: ");
-  Serial.print(angleError);
-  Serial.print(" SpeedA: ");
-  Serial.print(speedA);
-  Serial.print(" SpeedB: ");
-  Serial.println(speedB + motor_dif);
 }
 
-// 相対角度を計算する関数（-180から180の範囲で返す）
+// シーケンス2を実行する関数
+void sequence2() {
+  digitalWrite(OUTPUT_PIN, HIGH); // 出力ピンをHIGHに設定
+  delay(3000);                   // 5秒待機
+  digitalWrite(OUTPUT_PIN, LOW); // 出力ピンをLOWに戻す
+  delay(30000);
+　imu.MPU6050_CalcGyroOffsets();
+}
+
+// モーターを停止する関数
+void stopMotors() {
+  digitalWrite(STBY, LOW);     // スタンバイモードに設定
+  analogWrite(PWMA, 0);        // モーターAの速度を0に設定
+  analogWrite(PWMB, 0);        // モーターBの速度を0に設定
+}
+
+// モーターを有効にする関数
+void enableMotors() {
+  digitalWrite(STBY, HIGH);    // スタンバイ解除
+}
+
+// 現在の角度と基準角度の相対角度を計算する関数
 float calculateRelativeAngle(float current, float reference) {
   float diff = current - reference;
   if (diff > 180) diff -= 360;
@@ -116,100 +96,139 @@ float calculateRelativeAngle(float current, float reference) {
   return diff;
 }
 
-void sequence2() {
-  Serial.println("ニクロム線: 出力中...");
-  digitalWrite(OUTPUT_PIN, HIGH);
-  delay(5000);  // GPIO1への出力時間
-  digitalWrite(OUTPUT_PIN, LOW);
-  Serial.println("出力完了");
+// モーター速度を設定する関数
+void setMotorSpeeds(float angleError) {
+  int speedDiff = map(constrain(abs(angleError), 0, 45), 0, 45, 0, MAX_SPEED_DIFF);
+  int speedA, speedB;
+
+  // 角度誤差に応じて速度を調整
+  if (angleError < 0) {
+    speedA = BASE_SPEED + speedDiff * 3 + motorDiff;
+    speedB = BASE_SPEED - speedDiff * 3;
+  } else if (angleError > 0) {
+    speedA = BASE_SPEED - speedDiff * 3;
+    speedB = BASE_SPEED + speedDiff * 3 + motorDiff;
+  } else {
+    speedA = BASE_SPEED;
+    speedB = BASE_SPEED;
+  }
+
+  analogWrite(PWMA, speedA); // モーターAの速度を設定
+  analogWrite(PWMB, speedB); // モーターBの速度を設定
+
+  // デバッグ用のシリアル出力
+  Serial.print("Current Angle: ");
+  Serial.print(angleError);
+  Serial.print(" SpeedA: ");
+  Serial.print(speedA);
+  Serial.print(" SpeedB: ");
+  Serial.println(speedB);
+
+  // SDカードにデータを記録
+  unsigned long currentTime = millis();
+  String data = String(currentTime) + " " +
+                String(angleError) + " " +
+                String(imu.getaccx()) + " " +
+                String(imu.getaccy()) + " " +
+                String(imu.getaccz()) + " " +
+                String(imu.getgyrox()) + " " +
+                String(imu.getgyroy()) + " " +
+                String(imu.getgyroz()) + " " +
+                String(imu.getQMCRawx()) + " " +
+                String(imu.getQMCRawy()) + " " +
+                String(imu.getQMCRawz());
+  myFile.println(data);
+  myFile.flush(); // データを即時保存
 }
 
-void loop() {
-  static unsigned long pinLowTime = 0;          // フライトピンがLOWになった時刻
-  static bool sequenceStarted = false;          // シーケンス開始フラグ
-  static unsigned long calibrationStartTime = 0; // キャリブレーション開始時刻
-  static bool recalibrationInProgress = false;  // 再キャリブレーション中フラグ
-  static bool deviationDetected = false;        // 角度ずれが検出されたフラグ
-  static unsigned long angleDeviationStart = 0; // 角度ずれの開始時刻
+// 初期設定
+void setup() {
+  Serial.begin(9600);           // シリアル通信の初期化
+  Wire.begin();                 // I2C通信の初期化
 
-  // フライトピンの状態を取得
-  int pinState = digitalRead(PULLUP_PIN);
+  // SDカードの初期化
+  SPI.setTX(SD_MOSI);
+  SPI.setSCK(SD_SCK);
+  SPI.setRX(SD_MISO);
+  SPI.setCS(SD_CS);
+  if (!SD.begin(SD_CS, SPI)) {
+    Serial.println("SD Card initialization failed!");
+    return;
+  }
+  createNewFile();              // 新しいファイルを作成
+
+  // IMUの初期化
+  imu.QMC5883L_SetOffsets(147.00, -443.00, -152.00);
+  imu.QMC5883L_SetScales(1.10, 1.14, 0.82);
+  imu.Heading_Offset(360);
+  imu.begin(CHOOSE_ALL);
+  // ピンモードの設定
+  pinMode(PWMA, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH); // モーターを有効化
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
+  pinMode(PULLUP_PIN, INPUT_PULLUP);
+  pinMode(OUTPUT_PIN, OUTPUT);
+
+  Serial.println("Setup complete!");
+}
+
+// メインループ
+void loop() {
+  imu.Calculate();                 // IMUデータを計算
+  float currentAngle = imu.Data_Fusion(0.1); // IMUから融合された角度データを取得
+
+  static unsigned long pinLowTime = 0; // ピンLOW状態の時間を記録
+  static bool sequenceStarted = false; // シーケンス開始フラグ
+  int pinState = digitalRead(PULLUP_PIN); // PULLUPピンの状態を取得
 
   if (pinState == HIGH) {
-    // フライトピンが抜けている場合
     if (!sequenceStarted && pinLowTime == 0) {
-      Serial.println("フライトピンが抜けました");
-      pinLowTime = millis();
+      pinLowTime = millis(); // ピンLOW状態の開始時間を記録
     }
-
-    // ピンがLOWの状態が5秒以上継続したらシーケンスを開始
-    if (!sequenceStarted && millis() - pinLowTime >= 5000) {
-      Serial.println("シーケンス開始");
-      sequence2();  // シーケンス2実行
+    if (!sequenceStarted && millis() - pinLowTime >= 30000) {
+      sequence2(); // シーケンス2を実行
       sequenceStarted = true;
     }
   } else {
-    // フライトピンが刺さっている場合
     if (sequenceStarted || pinLowTime != 0) {
-      Serial.println("フライトピンが刺さりました");
-      pinLowTime = 0;          // 時刻をリセット
-      sequenceStarted = false; // シーケンス停止
-      imu.MPU6050_CalcGyroOffsets();
+      pinLowTime = 0;
+      sequenceStarted = false;
     }
   }
 
-  // シーケンスが開始されている場合の処理
   if (sequenceStarted) {
-    imu.Calculate();
-    float currentAngle = imu.Data_Fusion(0.1);
-
-    if (!isCalibrated || recalibrationInProgress) {
-      // キャリブレーション処理
+    if (!isCalibrated) {
       if (referenceAngle == -1) {
         referenceAngle = currentAngle;
-        calibrationStartTime = millis();
-        Serial.println("キャリブレーション開始...");
-      } else if (abs(currentAngle - referenceAngle) <= angleTolerance) {
-        if (millis() - calibrationStartTime >= stableTimeRequired) {
-          isCalibrated = true;
-          recalibrationInProgress = false;
-          Serial.print("キャリブレーション完了! 基準角度: ");
-          Serial.println(referenceAngle);
-        }
+        stableStartTime = millis();
+        Serial.println("Starting calibration...");
       } else {
-        referenceAngle = currentAngle;                                                                                        
-        calibrationStartTime = millis();
-        Serial.println(referenceAngle);
+        if (abs(currentAngle - referenceAngle) <= angleTolerance) {
+          if (millis() - stableStartTime >= stableTimeRequired) {
+            isCalibrated = true;
+            Serial.print("Calibration complete! Reference Angle: ");
+            Serial.println(referenceAngle);
+            enableMotors(); // モーターを有効化
+          }
+        } else {
+          referenceAngle = currentAngle;
+          stableStartTime = millis();
+          Serial.println("Recalibrating...");
+        }
       }
     } else {
-      // 通常動作: 角度ずれの検出と修正
       float relativeAngle = calculateRelativeAngle(currentAngle, referenceAngle);
-
-      if (abs(relativeAngle) > incorrectangle) {
-        if (!deviationDetected) {
-          deviationDetected = true;
-          angleDeviationStart = millis();
-        }
-
-        if (millis() - angleDeviationStart < runningtime) {
-          analogWrite(PWMA, BASE_SPEED);
-          analogWrite(PWMB, BASE_SPEED + motor_dif);
-          Serial.print(incorrectangle);
-          Serial.println("度以上ずれています。BASE_SPEEDで走行中...");
-        } else {
-          Serial.println("角度ずれが一定時間続きました。再キャリブレーションを開始します。");
-          stopMotors();
-          recalibrationInProgress = true;
-          isCalibrated = false;
-        }
-      } else {
-        deviationDetected = false;
-        float relativeAngle = calculateRelativeAngle(currentAngle, referenceAngle);
-        setMotorSpeeds(relativeAngle);
-        enableMotors();
-      }
+      setMotorSpeeds(relativeAngle); // モーター速度を設定
     }
+    delay(5); // データ更新間隔
   }
-
-  delay(80);
 }
